@@ -41,9 +41,7 @@ static void send_ack(struct connection *con, uint16_t ack_num)
         room = 0;
     ack.recv_window = htons((uint16_t)room);
 
-    char pkt[sizeof(ack) + POLI_CSUM_SIZE];
-    memcpy(pkt, &ack, sizeof(ack));
-    sendto(con->sockfd, pkt, poli_seal(pkt, sizeof(ack)), 0,
+    sendto(con->sockfd, &ack, sizeof(ack), 0,
            (struct sockaddr *)&con->servaddr, sizeof(con->servaddr));
 }
 
@@ -63,9 +61,7 @@ static void send_synack(int sockfd, struct sockaddr_in *dst, int conn_id,
     msg.hdr.recv_window = htons((uint16_t)window);
     msg.port = data_port;
 
-    char pkt[sizeof(msg) + POLI_CSUM_SIZE];
-    memcpy(pkt, &msg, sizeof(msg));
-    sendto(sockfd, pkt, poli_seal(pkt, sizeof(msg)), 0, (struct sockaddr *)dst, sizeof(*dst));
+    sendto(sockfd, &msg, sizeof(msg), 0, (struct sockaddr *)dst, sizeof(*dst));
 }
 
 int recv_data(int conn_id, char *buffer, int len)
@@ -119,8 +115,7 @@ void *receiver_handler(void *arg)
         /* Handle segment received from the sender. We use this between locks
         as to not have synchronization issues with the recv_data calls which are
         on the main thread */
-        int payload = poli_verify(segment, res);
-        if (payload >= (int)sizeof(poli_tcp_data_hdr))
+        if (res >= (int)sizeof(poli_tcp_data_hdr))
         {
             poli_tcp_data_hdr *hdr = (poli_tcp_data_hdr *)segment;
 
@@ -195,7 +190,6 @@ int wait4connect(uint32_t ip, uint16_t port)
     {
         int n = recvfrom(listen_sock, buf, MAX_SEGMENT_SIZE, 0,
                          (struct sockaddr *)&peer, &peerlen);
-        n = poli_verify(buf, n);
         if (n < (int)sizeof(poli_tcp_ctrl_hdr))
             continue;
 
@@ -265,7 +259,6 @@ int wait4connect(uint32_t ip, uint16_t port)
                     con->max_recv_buf, my_port);
 
         int n = recvfrom(con->sockfd, buf, MAX_SEGMENT_SIZE, 0, NULL, NULL);
-        n = poli_verify(buf, n);
         if (n < (int)sizeof(poli_tcp_ctrl_hdr))
             continue;
 

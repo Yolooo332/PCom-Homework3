@@ -12,4 +12,4 @@ fi
 
 rm -rf archive.zip
 make clean
-zip -r archive.zip lib/ *.c Makefile README
+zip -r archive.zip lib/ *.cpp Makefile README

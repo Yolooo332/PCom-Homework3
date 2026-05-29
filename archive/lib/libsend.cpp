@@ -51,7 +51,7 @@ int send_data(int conn_id, char *buffer, int len)
             sent_segment seg;
             memcpy(seg.data, &hdr, sizeof(hdr));
             memcpy(seg.data + sizeof(hdr), buffer + sent, chunk);
-            seg.len = poli_seal(seg.data, sizeof(hdr) + chunk);
+            seg.len = sizeof(hdr) + chunk;
             seg.seq = con->next_seq;
             clock_gettime(CLOCK_MONOTONIC, &seg.send_time);
 
@@ -99,7 +99,22 @@ void *sender_handler(void *arg)
         /* Handle segment received from the receiver. We use this between locks
         as to not have synchronization issues with the send_data calls which are
         on the main thread */
-        if (res == -1)
+        if (res >= (int)sizeof(poli_tcp_ctrl_hdr))
+        {
+            poli_tcp_ctrl_hdr *ctrl = (poli_tcp_ctrl_hdr *)buf;
+
+            if (ctrl->protocol_id == POLI_PROTOCOL_ID && ctrl->type == POLI_TYPE_ACK)
+            {
+                uint16_t ack = ntohs(ctrl->ack_num);
+
+                while (!con->unacked.empty() && con->unacked.front().seq < ack)
+                    con->unacked.pop_front();
+
+                con->base_seq = ack;
+                con->peer_window = ntohs(ctrl->recv_window);
+            }
+        }
+        else if (res == -1)
         {
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
@@ -113,26 +128,6 @@ void *sender_handler(void *arg)
                     sendto(con->sockfd, seg.data, seg.len, 0,
                            (struct sockaddr *)&con->servaddr, sizeof(con->servaddr));
                     seg.send_time = now;
-                }
-            }
-        }
-        else
-        {
-            /* drop it if the checksum doesn't add up (it got corrupted) */
-            int payload = poli_verify(buf, res);
-            if (payload >= (int)sizeof(poli_tcp_ctrl_hdr))
-            {
-                poli_tcp_ctrl_hdr *ctrl = (poli_tcp_ctrl_hdr *)buf;
-
-                if (ctrl->protocol_id == POLI_PROTOCOL_ID && ctrl->type == POLI_TYPE_ACK)
-                {
-                    uint16_t ack = ntohs(ctrl->ack_num);
-
-                    while (!con->unacked.empty() && con->unacked.front().seq < ack)
-                        con->unacked.pop_front();
-
-                    con->base_seq = ack;
-                    con->peer_window = ntohs(ctrl->recv_window);
                 }
             }
         }
@@ -187,13 +182,10 @@ int setup_connection(uint32_t ip, uint16_t port)
         syn.type = POLI_TYPE_SYN;
         syn.ack_num = 0;
         syn.recv_window = htons(9 * 1024);
-        char synbuf[sizeof(syn) + POLI_CSUM_SIZE];
-        memcpy(synbuf, &syn, sizeof(syn));
-        sendto(con->sockfd, synbuf, poli_seal(synbuf, sizeof(syn)), 0,
+        sendto(con->sockfd, &syn, sizeof(syn), 0,
                (struct sockaddr *)&con->servaddr, sizeof(con->servaddr));
 
         int n = recvfrom(con->sockfd, buf, MAX_SEGMENT_SIZE, 0, NULL, NULL);
-        n = poli_verify(buf, n);
         if (n < (int)(sizeof(poli_tcp_ctrl_hdr) + sizeof(uint16_t)))
             continue;
 
@@ -212,9 +204,7 @@ int setup_connection(uint32_t ip, uint16_t port)
         ack.type = POLI_TYPE_ACK;
         ack.ack_num = 0;
         ack.recv_window = htons(9 * 1024);
-        char ackbuf[sizeof(ack) + POLI_CSUM_SIZE];
-        memcpy(ackbuf, &ack, sizeof(ack));
-        sendto(con->sockfd, ackbuf, poli_seal(ackbuf, sizeof(ack)), 0,
+        sendto(con->sockfd, &ack, sizeof(ack), 0,
                (struct sockaddr *)&con->servaddr, sizeof(con->servaddr));
         break;
     }
