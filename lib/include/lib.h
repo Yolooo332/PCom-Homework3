@@ -17,7 +17,8 @@
 #define MAX_CONNECTIONS 32
 
 /* One sent segment kept in the sender's window until it gets ACKed. */
-struct sent_segment {
+struct sent_segment
+{
     char data[MAX_SEGMENT_SIZE];
     int len;
     uint16_t seq;
@@ -26,7 +27,8 @@ struct sent_segment {
 
 /* Protocol control block. Used for both sender and receiver sides.
  * Some fields are only useful on one side. */
-struct connection {
+struct connection
+{
     int sockfd;
     int conn_id;
     struct sockaddr_in servaddr; /* peer address */
@@ -34,15 +36,15 @@ struct connection {
     int max_window_seq;
 
     /* Sender state */
-    uint16_t next_seq;                       /* next seq number to assign */
-    uint16_t base_seq;                       /* first unacked seq */
-    std::deque<sent_segment> unacked;        /* sent but not ACKed yet */
-    int peer_window;                         /* receiver advertised window */
+    uint16_t next_seq;                /* next seq number to assign */
+    uint16_t base_seq;                /* first unacked seq */
+    std::deque<sent_segment> unacked; /* sent but not ACKed yet */
+    int peer_window;                  /* receiver advertised window */
 
     /* Receiver state */
-    uint16_t expected_seq;                                /* next in-order seq */
-    std::map<uint16_t, std::vector<char>> out_of_order;   /* buffered out-of-order */
-    std::deque<char> recv_buf;                            /* ready to deliver to app */
+    uint16_t expected_seq;                              /* next in-order seq */
+    std::map<uint16_t, std::vector<char>> out_of_order; /* buffered out-of-order */
+    std::deque<char> recv_buf;                          /* ready to deliver to app */
     int max_recv_buf;
 };
 

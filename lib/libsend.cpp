@@ -1,78 +1,63 @@
 #include <pthread.h>
 #include <cstdlib>
-#include <cstring>
 #include <map>
 #include <cstdint>
+#include "lib.h"
+#include "utils.h"
+#include "protocol.h"
 #include <cassert>
 #include <poll.h>
 #include <sys/timerfd.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <cstring>
 #include <algorithm>
-#include "lib.h"
-#include "utils.h"
-#include "protocol.h"
 
 using namespace std;
 
-/* Per-binary globals (also referenced as extern from libcommon.cpp). */
 std::map<int, struct connection *> cons;
+
 struct pollfd data_fds[MAX_CONNECTIONS];
+/* Used for timers per connection */
 struct pollfd timer_fds[MAX_CONNECTIONS];
 int fdmax = 0;
 
-/* Saved values from init_sender. Kept for completeness. */
-static int g_speed = 8;
-static int g_delay = 2;
+static int retx_timeout_ms = 30;
 
-/* Maximum number of segments inflight. 16 * 512 = 8 KB which fits in the
- * 9 KB receive buffer used by the server. */
-static const int MAX_INFLIGHT = 16;
-
-/* Retransmit a segment that has not been ACKed for too long. */
-static const long RETX_THRESHOLD_MS = 30;
-
-/* Send one segment over UDP. */
-static void send_segment(struct connection *con, const sent_segment &seg)
-{
-    sendto(con->sockfd, seg.data, seg.len, 0,
-           (struct sockaddr *)&con->servaddr, sizeof(con->servaddr));
-}
-
-/* Milliseconds between two timespecs */
-static long elapsed_ms(const struct timespec &a, const struct timespec &b)
-{
-    return (b.tv_sec - a.tv_sec) * 1000 + (b.tv_nsec - a.tv_nsec) / 1000000;
-}
+#define WINDOW_SEGMENTS 16
 
 int send_data(int conn_id, char *buffer, int len)
 {
-    int sent = 0;
     struct connection *con = cons[conn_id];
+    int sent = 0;
 
-    /* Keep pushing segments until everything fits in the window. We do this
-     * because client.cpp sleeps 500 ms whenever send_data returns less than
-     * the requested amount, which kills throughput. */
-    while (sent < len) {
+    while (sent < len)
+    {
         pthread_mutex_lock(&con->con_lock);
 
-        while ((int)con->unacked.size() < MAX_INFLIGHT && sent < len) {
-            int chunk = std::min((int)MAX_DATA_SIZE, len - sent);
+        /* We will write code here as to not have sync problems with sender_handler */
+        while ((int)con->unacked.size() < WINDOW_SEGMENTS && sent < len)
+        {
+            int chunk = min((int)MAX_DATA_SIZE, len - sent);
+
+            poli_tcp_data_hdr hdr;
+            hdr.protocol_id = POLI_PROTOCOL_ID;
+            hdr.conn_id = (uint8_t)con->conn_id;
+            hdr.type = POLI_TYPE_DATA;
+            hdr.seq_num = htons(con->next_seq);
+            hdr.len = htons((uint16_t)chunk);
 
             sent_segment seg;
-            poli_tcp_data_hdr *hdr = (poli_tcp_data_hdr *)seg.data;
-            hdr->protocol_id = POLI_PROTOCOL_ID;
-            hdr->conn_id = (uint8_t)con->conn_id;
-            hdr->type = POLI_TYPE_DATA;
-            hdr->seq_num = htons(con->next_seq);
-            hdr->len = htons((uint16_t)chunk);
-            memcpy(seg.data + sizeof(*hdr), buffer + sent, chunk);
-            seg.len = sizeof(*hdr) + chunk;
+            memcpy(seg.data, &hdr, sizeof(hdr));
+            memcpy(seg.data + sizeof(hdr), buffer + sent, chunk);
+            seg.len = sizeof(hdr) + chunk;
             seg.seq = con->next_seq;
-
             clock_gettime(CLOCK_MONOTONIC, &seg.send_time);
-            send_segment(con, seg);
+
+            sendto(con->sockfd, seg.data, seg.len, 0,
+                   (struct sockaddr *)&con->servaddr, sizeof(con->servaddr));
+
             con->unacked.push_back(seg);
             con->next_seq++;
             sent += chunk;
@@ -80,7 +65,8 @@ int send_data(int conn_id, char *buffer, int len)
 
         pthread_mutex_unlock(&con->con_lock);
 
-        if (sent < len) usleep(100); /* wait for ACKs to free the window */
+        if (sent < len)
+            usleep(100);
     }
 
     return sent;
@@ -88,49 +74,59 @@ int send_data(int conn_id, char *buffer, int len)
 
 void *sender_handler(void *arg)
 {
-    char buf[MAX_SEGMENT_SIZE];
     int res = 0;
+    char buf[MAX_SEGMENT_SIZE];
 
-    while (1) {
+    while (1)
+    {
 
-        if (cons.size() == 0) {
+        if (cons.size() == 0)
+        {
             continue;
         }
-
         int conn_id = -1;
-        do {
+        do
+        {
             res = recv_message_or_timeout(buf, MAX_SEGMENT_SIZE, &conn_id);
         } while (res == -14);
 
-        if (cons.find(conn_id) == cons.end()) {
+        if (cons.find(conn_id) == cons.end())
             continue;
-        }
 
         pthread_mutex_lock(&cons[conn_id]->con_lock);
         struct connection *con = cons[conn_id];
 
-        if (res >= (int)sizeof(poli_tcp_ctrl_hdr)) {
-            /* Got something from the receiver. We only care about ACKs. */
-            poli_tcp_ctrl_hdr *hdr = (poli_tcp_ctrl_hdr *)buf;
-            if (hdr->protocol_id == POLI_PROTOCOL_ID && hdr->type == POLI_TYPE_ACK) {
-                uint16_t ack = ntohs(hdr->ack_num);
-                con->peer_window = ntohs(hdr->recv_window);
+        /* Handle segment received from the receiver. We use this between locks
+        as to not have synchronization issues with the send_data calls which are
+        on the main thread */
+        if (res >= (int)sizeof(poli_tcp_ctrl_hdr))
+        {
+            poli_tcp_ctrl_hdr *ctrl = (poli_tcp_ctrl_hdr *)buf;
 
-                /* Cumulative ACK: drop everything below ack */
-                while (!con->unacked.empty() && con->unacked.front().seq < ack) {
+            if (ctrl->protocol_id == POLI_PROTOCOL_ID && ctrl->type == POLI_TYPE_ACK)
+            {
+                uint16_t ack = ntohs(ctrl->ack_num);
+
+                while (!con->unacked.empty() && con->unacked.front().seq < ack)
                     con->unacked.pop_front();
-                }
+
                 con->base_seq = ack;
+                con->peer_window = ntohs(ctrl->recv_window);
             }
-        } else if (res == -1) {
-            /* Timer expired: only retransmit segments that have been waiting
-             * for an ACK longer than the threshold. This avoids resending
-             * packets that are still legitimately in flight. */
+        }
+        else if (res == -1)
+        {
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
-            for (auto &seg : con->unacked) {
-                if (elapsed_ms(seg.send_time, now) >= RETX_THRESHOLD_MS) {
-                    send_segment(con, seg);
+
+            for (size_t i = 0; i < con->unacked.size(); i++)
+            {
+                sent_segment &seg = con->unacked[i];
+                long age = (now.tv_sec - seg.send_time.tv_sec) * 1000 + (now.tv_nsec - seg.send_time.tv_nsec) / 1000000;
+                if (age >= retx_timeout_ms)
+                {
+                    sendto(con->sockfd, seg.data, seg.len, 0,
+                           (struct sockaddr *)&con->servaddr, sizeof(con->servaddr));
                     seg.send_time = now;
                 }
             }
@@ -138,13 +134,16 @@ void *sender_handler(void *arg)
 
         pthread_mutex_unlock(&cons[conn_id]->con_lock);
     }
-    return NULL;
 }
 
 int setup_connection(uint32_t ip, uint16_t port)
 {
+    /* Implement the sender part of the Three Way Handshake. Blocks
+    until the connection is established */
+
     struct connection *con = new struct connection();
     con->sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+
     con->servaddr.sin_family = AF_INET;
     con->servaddr.sin_addr.s_addr = ip;
     con->servaddr.sin_port = port;
@@ -154,17 +153,29 @@ int setup_connection(uint32_t ip, uint16_t port)
     con->peer_window = 9 * 1024;
     pthread_mutex_init(&con->con_lock, NULL);
 
-    /* 3-way handshake. Use a short recv timeout so we can retransmit
-     * the SYN if SYN or SYN-ACK gets lost. */
+    /* // This can be used to set a timer on a socket
+    struct timeval tv;
+    tv.tv_sec = 2;
+    tv.tv_usec = 100000;
+    if (setsockopt(con->sockfd, SOL_SOCKET, SO_RCVTIMEO,&tv,sizeof(tv)) < 0) {
+        perror("Error");
+    } */
+
     struct timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = 300000;
-    setsockopt(con->sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (setsockopt(con->sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0)
+    {
+        perror("Error");
+    }
 
     char buf[MAX_SEGMENT_SIZE];
 
-    while (1) {
-        /* Send SYN */
+    /* We will send the SYN on 8031. Then we will receive a SYN-ACK with the connection
+     * port. We can use con->sockfd for both cases, but we will need to update server_addr
+     * with the port received via SYN-ACK */
+    while (1)
+    {
         poli_tcp_ctrl_hdr syn;
         syn.protocol_id = POLI_PROTOCOL_ID;
         syn.conn_id = 0;
@@ -174,23 +185,19 @@ int setup_connection(uint32_t ip, uint16_t port)
         sendto(con->sockfd, &syn, sizeof(syn), 0,
                (struct sockaddr *)&con->servaddr, sizeof(con->servaddr));
 
-        /* Wait for SYN-ACK */
         int n = recvfrom(con->sockfd, buf, MAX_SEGMENT_SIZE, 0, NULL, NULL);
-        if (n < (int)(sizeof(poli_tcp_ctrl_hdr) + sizeof(uint16_t))) {
+        if (n < (int)(sizeof(poli_tcp_ctrl_hdr) + sizeof(uint16_t)))
             continue;
-        }
-        poli_tcp_ctrl_hdr *r = (poli_tcp_ctrl_hdr *)buf;
-        if (r->protocol_id != POLI_PROTOCOL_ID || r->type != POLI_TYPE_SYNACK) {
-            continue;
-        }
 
-        /* Server told us which port to use for this connection. */
-        uint16_t new_port;
-        memcpy(&new_port, buf + sizeof(poli_tcp_ctrl_hdr), sizeof(new_port));
-        con->servaddr.sin_port = new_port;
+        poli_tcp_ctrl_hdr *r = (poli_tcp_ctrl_hdr *)buf;
+        if (r->protocol_id != POLI_PROTOCOL_ID || r->type != POLI_TYPE_SYNACK)
+            continue;
+
+        uint16_t data_port;
+        memcpy(&data_port, buf + sizeof(poli_tcp_ctrl_hdr), sizeof(data_port));
+        con->servaddr.sin_port = data_port;
         con->conn_id = r->conn_id;
 
-        /* Send the final ACK */
         poli_tcp_ctrl_hdr ack;
         ack.protocol_id = POLI_PROTOCOL_ID;
         ack.conn_id = (uint8_t)con->conn_id;
@@ -202,25 +209,25 @@ int setup_connection(uint32_t ip, uint16_t port)
         break;
     }
 
-    /* Disable the receive timeout for normal operation */
-    struct timeval tv0 = {0, 0};
-    setsockopt(con->sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv0, sizeof(tv0));
+    struct timeval off = {0, 0};
+    setsockopt(con->sockfd, SOL_SOCKET, SO_RCVTIMEO, &off, sizeof(off));
 
     cons.insert({con->conn_id, con});
 
-    /* Register socket for the handler thread to poll. */
+    /* Since we can have multiple connection, we want to know if data is available
+       on the socket used by a given connection. We use POLL for this */
     data_fds[fdmax].fd = con->sockfd;
     data_fds[fdmax].events = POLLIN;
 
-    /* Per-connection timer used to drive retransmissions. Fires every 10 ms;
-     * the handler decides per-segment which ones are actually due. */
+    /* This creates a timer and sets it to trigger every 1 sec. We use this
+       to know if a timeout has happend on our connection */
     timer_fds[fdmax].fd = timerfd_create(CLOCK_REALTIME, 0);
     timer_fds[fdmax].events = POLLIN;
     struct itimerspec spec;
     spec.it_value.tv_sec = 0;
-    spec.it_value.tv_nsec = 10000000;
+    spec.it_value.tv_nsec = 10 * 1000000;
     spec.it_interval.tv_sec = 0;
-    spec.it_interval.tv_nsec = 10000000;
+    spec.it_interval.tv_nsec = 10 * 1000000;
     timerfd_settime(timer_fds[fdmax].fd, 0, &spec, NULL);
     fdmax++;
 
@@ -231,10 +238,12 @@ int setup_connection(uint32_t ip, uint16_t port)
 
 void init_sender(int speed, int delay)
 {
-    g_speed = speed;
-    g_delay = delay;
+    retx_timeout_ms = TIMEOUT_SEND(delay);
 
     pthread_t thread1;
-    int ret = pthread_create(&thread1, NULL, sender_handler, NULL);
+    int ret;
+
+    /* Create a thread that will*/
+    ret = pthread_create(&thread1, NULL, sender_handler, NULL);
     assert(ret == 0);
 }

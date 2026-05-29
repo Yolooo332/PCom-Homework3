@@ -1,58 +1,81 @@
 #include <pthread.h>
 #include <cstdlib>
-#include <cstring>
 #include <map>
 #include <cstdint>
-#include <cassert>
+#include "lib.h"
+#include "utils.h"
+#include "protocol.h"
 #include <poll.h>
+#include <cassert>
 #include <sys/timerfd.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <cstring>
+#include <vector>
 #include <algorithm>
-#include "lib.h"
-#include "utils.h"
-#include "protocol.h"
 
 using namespace std;
 
-/* Per-binary globals (also referenced as extern from libcommon.cpp). */
 std::map<int, struct connection *> cons;
+
 struct pollfd data_fds[MAX_CONNECTIONS];
+/* Used for timers per connection */
 struct pollfd timer_fds[MAX_CONNECTIONS];
 int fdmax = 0;
 
-static int accept_sockfd = -1;
-static int next_conn_id = 0;
-static int g_recv_buf_bytes = 9 * 1024;
+static int listen_sock = -1;
+static int conn_counter = 0;
+static int recv_window_bytes = 9 * 1024;
 
 static void send_ack(struct connection *con, uint16_t ack_num)
 {
-    poli_tcp_ctrl_hdr hdr;
-    hdr.protocol_id = POLI_PROTOCOL_ID;
-    hdr.conn_id = (uint8_t)con->conn_id;
-    hdr.type = POLI_TYPE_ACK;
-    hdr.ack_num = htons(ack_num);
+    poli_tcp_ctrl_hdr ack;
+    ack.protocol_id = POLI_PROTOCOL_ID;
+    ack.conn_id = (uint8_t)con->conn_id;
+    ack.type = POLI_TYPE_ACK;
+    ack.ack_num = htons(ack_num);
 
-    int free_window = con->max_recv_buf - (int)con->recv_buf.size();
-    if (free_window < 0)
-        free_window = 0;
-    hdr.recv_window = htons((uint16_t)free_window);
+    int room = con->max_recv_buf - (int)con->recv_buf.size();
+    if (room < 0)
+        room = 0;
+    ack.recv_window = htons((uint16_t)room);
 
-    sendto(con->sockfd, &hdr, sizeof(hdr), 0,
+    sendto(con->sockfd, &ack, sizeof(ack), 0,
            (struct sockaddr *)&con->servaddr, sizeof(con->servaddr));
+}
+
+static void send_synack(int sockfd, struct sockaddr_in *dst, int conn_id,
+                        int window, uint16_t data_port)
+{
+    struct
+    {
+        poli_tcp_ctrl_hdr hdr;
+        uint16_t port;
+    } __attribute__((packed)) msg;
+
+    msg.hdr.protocol_id = POLI_PROTOCOL_ID;
+    msg.hdr.conn_id = (uint8_t)conn_id;
+    msg.hdr.type = POLI_TYPE_SYNACK;
+    msg.hdr.ack_num = 0;
+    msg.hdr.recv_window = htons((uint16_t)window);
+    msg.port = data_port;
+
+    sendto(sockfd, &msg, sizeof(msg), 0, (struct sockaddr *)dst, sizeof(*dst));
 }
 
 int recv_data(int conn_id, char *buffer, int len)
 {
+    struct connection *con = cons[conn_id];
+
     while (1)
     {
-        pthread_mutex_lock(&cons[conn_id]->con_lock);
-        struct connection *con = cons[conn_id];
+        pthread_mutex_lock(&con->con_lock);
 
+        /* We will write code here as to not have sync problems with recv_handler */
         if (!con->recv_buf.empty())
         {
-            int n = std::min((int)con->recv_buf.size(), len);
+            int n = min((int)con->recv_buf.size(), len);
             for (int i = 0; i < n; i++)
             {
                 buffer[i] = con->recv_buf.front();
@@ -61,6 +84,7 @@ int recv_data(int conn_id, char *buffer, int len)
             pthread_mutex_unlock(&con->con_lock);
             return n;
         }
+
         pthread_mutex_unlock(&con->con_lock);
         usleep(1000);
     }
@@ -68,9 +92,7 @@ int recv_data(int conn_id, char *buffer, int len)
 
 void *receiver_handler(void *arg)
 {
-    /* Handle segment received from the sender. We use this between locks
-    as to not have synchronization issues with the recv_data calls which are
-    on the main thread */
+
     char segment[MAX_SEGMENT_SIZE];
     int res;
     DEBUG_PRINT("Starting recviver handler\n");
@@ -85,37 +107,42 @@ void *receiver_handler(void *arg)
         } while (res == -14);
 
         if (cons.find(conn_id) == cons.end())
-        {
             continue;
-        }
 
         pthread_mutex_lock(&cons[conn_id]->con_lock);
         struct connection *con = cons[conn_id];
 
+        /* Handle segment received from the sender. We use this between locks
+        as to not have synchronization issues with the recv_data calls which are
+        on the main thread */
         if (res >= (int)sizeof(poli_tcp_data_hdr))
         {
             poli_tcp_data_hdr *hdr = (poli_tcp_data_hdr *)segment;
+
             if (hdr->protocol_id == POLI_PROTOCOL_ID && hdr->type == POLI_TYPE_DATA)
             {
                 uint16_t seq = ntohs(hdr->seq_num);
-                uint16_t plen = ntohs(hdr->len);
-                const char *payload = segment + sizeof(poli_tcp_data_hdr);
+                uint16_t paylen = ntohs(hdr->len);
+                char *payload = segment + sizeof(poli_tcp_data_hdr);
 
                 if (seq == con->expected_seq)
                 {
-                    con->recv_buf.insert(con->recv_buf.end(), payload, payload + plen);
+                    con->recv_buf.insert(con->recv_buf.end(), payload, payload + paylen);
                     con->expected_seq++;
-                    while (con->out_of_order.count(con->expected_seq))
+
+                    map<uint16_t, vector<char>>::iterator it;
+                    while ((it = con->out_of_order.find(con->expected_seq)) !=
+                           con->out_of_order.end())
                     {
-                        auto &v = con->out_of_order[con->expected_seq];
-                        con->recv_buf.insert(con->recv_buf.end(), v.begin(), v.end());
-                        con->out_of_order.erase(con->expected_seq);
+                        con->recv_buf.insert(con->recv_buf.end(),
+                                             it->second.begin(), it->second.end());
+                        con->out_of_order.erase(it);
                         con->expected_seq++;
                     }
                 }
                 else if (seq > con->expected_seq)
                 {
-                    con->out_of_order[seq] = std::vector<char>(payload, payload + plen);
+                    con->out_of_order[seq] = vector<char>(payload, payload + paylen);
                 }
 
                 send_ack(con, con->expected_seq);
@@ -124,98 +151,102 @@ void *receiver_handler(void *arg)
 
         pthread_mutex_unlock(&cons[conn_id]->con_lock);
     }
-    return NULL;
 }
 
 int wait4connect(uint32_t ip, uint16_t port)
 {
     /* TODO: Implement the Three Way Handshake on the receiver part. This blocks
      * until a connection is established. */
-    if (accept_sockfd == -1)
+
+    if (listen_sock == -1)
     {
-        accept_sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-        int reuse = 1;
-        setsockopt(accept_sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        listen_sock = socket(AF_INET, SOCK_DGRAM, 0);
+
+        int yes = 1;
+        setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
         struct sockaddr_in addr;
         memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = ip;
         addr.sin_port = port;
-        int rc = bind(accept_sockfd, (struct sockaddr *)&addr, sizeof(addr));
+        int rc = bind(listen_sock, (struct sockaddr *)&addr, sizeof(addr));
         assert(rc == 0);
     }
 
     struct connection *con = new struct connection();
-    con->conn_id = next_conn_id++;
+    con->conn_id = conn_counter++;
     con->expected_seq = 0;
-    con->max_recv_buf = g_recv_buf_bytes;
+    con->max_recv_buf = recv_window_bytes;
     pthread_mutex_init(&con->con_lock, NULL);
 
     char buf[MAX_SEGMENT_SIZE];
-    struct sockaddr_in client_addr;
-    socklen_t client_len = sizeof(client_addr);
+    struct sockaddr_in peer;
+    socklen_t peerlen = sizeof(peer);
 
-    /* Wait for a SYN on the accept socket. If we see a SYN from a client we
-     * already accepted earlier, it's a retransmit (its SYN-ACK got lost).
-     * Resend the SYN-ACK from the existing per-client socket and keep waiting
-     * for a brand new client. */
+    /* Receive SYN on the connection socket. Create a new socket and bind it to
+     * the chosen port. Send the data port number via SYN-ACK to the client */
     while (1)
     {
-        int n = recvfrom(accept_sockfd, buf, MAX_SEGMENT_SIZE, 0,
-                         (struct sockaddr *)&client_addr, &client_len);
+        int n = recvfrom(listen_sock, buf, MAX_SEGMENT_SIZE, 0,
+                         (struct sockaddr *)&peer, &peerlen);
         if (n < (int)sizeof(poli_tcp_ctrl_hdr))
             continue;
+
         poli_tcp_ctrl_hdr *hdr = (poli_tcp_ctrl_hdr *)buf;
         if (hdr->protocol_id != POLI_PROTOCOL_ID || hdr->type != POLI_TYPE_SYN)
             continue;
 
-        bool duplicate = false;
-        for (auto &kv : cons)
+        bool already_have_it = false;
+        for (map<int, struct connection *>::iterator it = cons.begin();
+             it != cons.end(); ++it)
         {
-            struct connection *ex = kv.second;
-            if (ex->servaddr.sin_addr.s_addr == client_addr.sin_addr.s_addr &&
-                ex->servaddr.sin_port == client_addr.sin_port)
+            struct connection *other = it->second;
+            if (other->servaddr.sin_addr.s_addr == peer.sin_addr.s_addr &&
+                other->servaddr.sin_port == peer.sin_port)
             {
-                struct sockaddr_in ex_bind;
-                socklen_t sl = sizeof(ex_bind);
-                getsockname(ex->sockfd, (struct sockaddr *)&ex_bind, &sl);
-                struct
-                {
-                    poli_tcp_ctrl_hdr hdr;
-                    uint16_t port;
-                } __attribute__((packed)) synack;
-                synack.hdr.protocol_id = POLI_PROTOCOL_ID;
-                synack.hdr.conn_id = (uint8_t)ex->conn_id;
-                synack.hdr.type = POLI_TYPE_SYNACK;
-                synack.hdr.ack_num = 0;
-                synack.hdr.recv_window = htons((uint16_t)ex->max_recv_buf);
-                synack.port = ex_bind.sin_port;
-                sendto(ex->sockfd, &synack, sizeof(synack), 0,
-                       (struct sockaddr *)&ex->servaddr, sizeof(ex->servaddr));
-                duplicate = true;
+
+                struct sockaddr_in bound;
+                socklen_t bl = sizeof(bound);
+                getsockname(other->sockfd, (struct sockaddr *)&bound, &bl);
+
+                send_synack(other->sockfd, &other->servaddr, other->conn_id,
+                            other->max_recv_buf, bound.sin_port);
+                already_have_it = true;
                 break;
             }
         }
-        if (duplicate)
+        if (already_have_it)
             continue;
+
         break;
     }
 
     con->sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in con_bind;
-    memset(&con_bind, 0, sizeof(con_bind));
-    con_bind.sin_family = AF_INET;
-    con_bind.sin_addr.s_addr = INADDR_ANY;
-    con_bind.sin_port = 0;
-    int rc = bind(con->sockfd, (struct sockaddr *)&con_bind, sizeof(con_bind));
+
+    struct sockaddr_in mine;
+    memset(&mine, 0, sizeof(mine));
+    mine.sin_family = AF_INET;
+    mine.sin_addr.s_addr = INADDR_ANY;
+    mine.sin_port = 0;
+    int rc = bind(con->sockfd, (struct sockaddr *)&mine, sizeof(mine));
     assert(rc == 0);
 
-    socklen_t sl = sizeof(con_bind);
-    getsockname(con->sockfd, (struct sockaddr *)&con_bind, &sl);
-    uint16_t chosen_port = con_bind.sin_port;
+    socklen_t ml = sizeof(mine);
+    getsockname(con->sockfd, (struct sockaddr *)&mine, &ml);
+    uint16_t my_port = mine.sin_port;
 
-    con->servaddr = client_addr;
+    con->servaddr = peer;
+
+    /* This can be used to set a timer on a socket, useful once we received a
+     * SYN. You may want to disable by setting the time to 0 (tv_sec = 0,
+     * tv_usec = 0)
+    struct timeval tv;
+    tv.tv_sec = 2;
+    tv.tv_usec = 100000;
+    if (setsockopt(con->sockfd, SOL_SOCKET, SO_RCVTIMEO,&tv,sizeof(tv)) < 0) {
+        perror("Error");
+    } */
 
     struct timeval tv;
     tv.tv_sec = 0;
@@ -224,23 +255,13 @@ int wait4connect(uint32_t ip, uint16_t port)
 
     while (1)
     {
-        struct
-        {
-            poli_tcp_ctrl_hdr hdr;
-            uint16_t port;
-        } __attribute__((packed)) synack;
-        synack.hdr.protocol_id = POLI_PROTOCOL_ID;
-        synack.hdr.conn_id = (uint8_t)con->conn_id;
-        synack.hdr.type = POLI_TYPE_SYNACK;
-        synack.hdr.ack_num = 0;
-        synack.hdr.recv_window = htons((uint16_t)con->max_recv_buf);
-        synack.port = chosen_port;
-        sendto(con->sockfd, &synack, sizeof(synack), 0,
-               (struct sockaddr *)&con->servaddr, sizeof(con->servaddr));
+        send_synack(con->sockfd, &con->servaddr, con->conn_id,
+                    con->max_recv_buf, my_port);
 
         int n = recvfrom(con->sockfd, buf, MAX_SEGMENT_SIZE, 0, NULL, NULL);
         if (n < (int)sizeof(poli_tcp_ctrl_hdr))
             continue;
+
         poli_tcp_ctrl_hdr *r = (poli_tcp_ctrl_hdr *)buf;
         if (r->protocol_id != POLI_PROTOCOL_ID)
             continue;
@@ -248,14 +269,18 @@ int wait4connect(uint32_t ip, uint16_t port)
             break;
     }
 
-    struct timeval tv0 = {0, 0};
-    setsockopt(con->sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv0, sizeof(tv0));
+    struct timeval off = {0, 0};
+    setsockopt(con->sockfd, SOL_SOCKET, SO_RCVTIMEO, &off, sizeof(off));
 
     cons.insert({con->conn_id, con});
 
+    /* Since we can have multiple connection, we want to know if data is available
+       on the socket used by a given connection. We use POLL for this */
     data_fds[fdmax].fd = con->sockfd;
     data_fds[fdmax].events = POLLIN;
 
+    /* This creates a timer and sets it to trigger every 1 sec. We use this
+       to know if a timeout has happend on a connection */
     timer_fds[fdmax].fd = timerfd_create(CLOCK_REALTIME, 0);
     timer_fds[fdmax].events = POLLIN;
     struct itimerspec spec;
@@ -273,10 +298,12 @@ int wait4connect(uint32_t ip, uint16_t port)
 
 void init_receiver(int recv_buffer_bytes)
 {
-    g_recv_buf_bytes = recv_buffer_bytes;
+    recv_window_bytes = recv_buffer_bytes;
 
     pthread_t thread1;
+    int ret;
+
     /* TODO: Create the connection socket and bind it to 8031 */
-    int ret = pthread_create(&thread1, NULL, receiver_handler, NULL);
+    ret = pthread_create(&thread1, NULL, receiver_handler, NULL);
     assert(ret == 0);
 }

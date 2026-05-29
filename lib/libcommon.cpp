@@ -1,7 +1,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/timerfd.h>
-#include <netinet/ip.h> 
+#include <netinet/ip.h>
 #include <stdio.h>
 #include <cstdint>
 #include "lib.h"
@@ -29,24 +29,28 @@ int recv_message_or_timeout(char *buff, size_t len, int *conn_id)
     int ret, i;
 
     /* We check if data is available on a socket or if a timer has expired */
-    ret = poll(data_fds, fdmax, 0); 
+    ret = poll(data_fds, fdmax, 0);
     assert(ret >= 0);
-    ret = poll(timer_fds, fdmax, 0); 
+    ret = poll(timer_fds, fdmax, 0);
     assert(ret >= 0);
 
-    for (i = 0; i < fdmax; i++) {
+    for (i = 0; i < fdmax; i++)
+    {
         /* Data available on a socket */
-        if (data_fds[i].revents & POLLIN) {
+        if (data_fds[i].revents & POLLIN)
+        {
 
             struct sockaddr_in servaddr;
             socklen_t slen = sizeof(struct sockaddr_in);
 
-            int n = recvfrom(data_fds[i].fd, buff, len, MSG_WAITALL, (struct sockaddr *) &servaddr , &slen);
-            int j = -1; 
+            int n = recvfrom(data_fds[i].fd, buff, len, MSG_WAITALL, (struct sockaddr *)&servaddr, &slen);
+            int j = -1;
 
             /* Find which connection this socket coresponds to */
-            for (auto const& x : cons) {
-                if(x.second->sockfd == data_fds[i].fd) {
+            for (auto const &x : cons)
+            {
+                if (x.second->sockfd == data_fds[i].fd)
+                {
                     j = x.first;
                     break;
                 }
@@ -58,15 +62,18 @@ int recv_message_or_timeout(char *buff, size_t len, int *conn_id)
             return n;
         }
         /* A timer has expired on a connection */
-        if (timer_fds[i].revents & POLLIN) {
+        if (timer_fds[i].revents & POLLIN)
+        {
 
             char dummybuf[8];
             read(timer_fds[i].fd, dummybuf, 8);
 
             /* Find which connection this coresponds to */
-            int j = -1; 
-            for (auto const& x : cons) {
-                if(x.second->sockfd == data_fds[i].fd) {
+            int j = -1;
+            for (auto const &x : cons)
+            {
+                if (x.second->sockfd == data_fds[i].fd)
+                {
                     j = x.first;
                     break;
                 }
