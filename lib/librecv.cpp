@@ -22,14 +22,10 @@ struct pollfd data_fds[MAX_CONNECTIONS];
 struct pollfd timer_fds[MAX_CONNECTIONS];
 int fdmax = 0;
 
-/* Listening socket on port 8032. Bound once on the first wait4connect call. */
 static int accept_sockfd = -1;
-/* Connection id we assign to the next accepted client. */
 static int next_conn_id = 0;
-/* Saved from init_receiver, used as advertised window for flow control. */
 static int g_recv_buf_bytes = 9 * 1024;
 
-/* Build and send an ACK segment to the peer of this connection. */
 static void send_ack(struct connection *con, uint16_t ack_num)
 {
     poli_tcp_ctrl_hdr hdr;
@@ -39,7 +35,8 @@ static void send_ack(struct connection *con, uint16_t ack_num)
     hdr.ack_num = htons(ack_num);
 
     int free_window = con->max_recv_buf - (int)con->recv_buf.size();
-    if (free_window < 0) free_window = 0;
+    if (free_window < 0)
+        free_window = 0;
     hdr.recv_window = htons((uint16_t)free_window);
 
     sendto(con->sockfd, &hdr, sizeof(hdr), 0,
@@ -48,14 +45,16 @@ static void send_ack(struct connection *con, uint16_t ack_num)
 
 int recv_data(int conn_id, char *buffer, int len)
 {
-    /* Block until there is data available in the connection's buffer. */
-    while (1) {
+    while (1)
+    {
         pthread_mutex_lock(&cons[conn_id]->con_lock);
         struct connection *con = cons[conn_id];
 
-        if (!con->recv_buf.empty()) {
+        if (!con->recv_buf.empty())
+        {
             int n = std::min((int)con->recv_buf.size(), len);
-            for (int i = 0; i < n; i++) {
+            for (int i = 0; i < n; i++)
+            {
                 buffer[i] = con->recv_buf.front();
                 con->recv_buf.pop_front();
             }
@@ -69,52 +68,59 @@ int recv_data(int conn_id, char *buffer, int len)
 
 void *receiver_handler(void *arg)
 {
+    /* Handle segment received from the sender. We use this between locks
+    as to not have synchronization issues with the recv_data calls which are
+    on the main thread */
     char segment[MAX_SEGMENT_SIZE];
     int res;
     DEBUG_PRINT("Starting recviver handler\n");
 
-    while (1) {
+    while (1)
+    {
 
         int conn_id = -1;
-        do {
+        do
+        {
             res = recv_message_or_timeout(segment, MAX_SEGMENT_SIZE, &conn_id);
         } while (res == -14);
 
-        if (cons.find(conn_id) == cons.end()) {
+        if (cons.find(conn_id) == cons.end())
+        {
             continue;
         }
 
         pthread_mutex_lock(&cons[conn_id]->con_lock);
         struct connection *con = cons[conn_id];
 
-        if (res >= (int)sizeof(poli_tcp_data_hdr)) {
+        if (res >= (int)sizeof(poli_tcp_data_hdr))
+        {
             poli_tcp_data_hdr *hdr = (poli_tcp_data_hdr *)segment;
-            if (hdr->protocol_id == POLI_PROTOCOL_ID && hdr->type == POLI_TYPE_DATA) {
+            if (hdr->protocol_id == POLI_PROTOCOL_ID && hdr->type == POLI_TYPE_DATA)
+            {
                 uint16_t seq = ntohs(hdr->seq_num);
                 uint16_t plen = ntohs(hdr->len);
                 const char *payload = segment + sizeof(poli_tcp_data_hdr);
 
-                if (seq == con->expected_seq) {
-                    /* In order: deliver and flush buffered out-of-order segments */
+                if (seq == con->expected_seq)
+                {
                     con->recv_buf.insert(con->recv_buf.end(), payload, payload + plen);
                     con->expected_seq++;
-                    while (con->out_of_order.count(con->expected_seq)) {
+                    while (con->out_of_order.count(con->expected_seq))
+                    {
                         auto &v = con->out_of_order[con->expected_seq];
                         con->recv_buf.insert(con->recv_buf.end(), v.begin(), v.end());
                         con->out_of_order.erase(con->expected_seq);
                         con->expected_seq++;
                     }
-                } else if (seq > con->expected_seq) {
-                    /* Out of order: buffer it */
+                }
+                else if (seq > con->expected_seq)
+                {
                     con->out_of_order[seq] = std::vector<char>(payload, payload + plen);
                 }
-                /* else: duplicate, drop */
 
-                /* Always reply with the current expected_seq as cumulative ACK */
                 send_ack(con, con->expected_seq);
             }
         }
-        /* res == -1: timer fired. Nothing to do on receiver side. */
 
         pthread_mutex_unlock(&cons[conn_id]->con_lock);
     }
@@ -123,8 +129,10 @@ void *receiver_handler(void *arg)
 
 int wait4connect(uint32_t ip, uint16_t port)
 {
-    /* Lazily bind the accept socket the first time someone calls wait4connect. */
-    if (accept_sockfd == -1) {
+    /* TODO: Implement the Three Way Handshake on the receiver part. This blocks
+     * until a connection is established. */
+    if (accept_sockfd == -1)
+    {
         accept_sockfd = socket(AF_INET, SOCK_DGRAM, 0);
         int reuse = 1;
         setsockopt(accept_sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
@@ -152,22 +160,28 @@ int wait4connect(uint32_t ip, uint16_t port)
      * already accepted earlier, it's a retransmit (its SYN-ACK got lost).
      * Resend the SYN-ACK from the existing per-client socket and keep waiting
      * for a brand new client. */
-    while (1) {
+    while (1)
+    {
         int n = recvfrom(accept_sockfd, buf, MAX_SEGMENT_SIZE, 0,
                          (struct sockaddr *)&client_addr, &client_len);
-        if (n < (int)sizeof(poli_tcp_ctrl_hdr)) continue;
+        if (n < (int)sizeof(poli_tcp_ctrl_hdr))
+            continue;
         poli_tcp_ctrl_hdr *hdr = (poli_tcp_ctrl_hdr *)buf;
-        if (hdr->protocol_id != POLI_PROTOCOL_ID || hdr->type != POLI_TYPE_SYN) continue;
+        if (hdr->protocol_id != POLI_PROTOCOL_ID || hdr->type != POLI_TYPE_SYN)
+            continue;
 
         bool duplicate = false;
-        for (auto &kv : cons) {
+        for (auto &kv : cons)
+        {
             struct connection *ex = kv.second;
             if (ex->servaddr.sin_addr.s_addr == client_addr.sin_addr.s_addr &&
-                ex->servaddr.sin_port == client_addr.sin_port) {
+                ex->servaddr.sin_port == client_addr.sin_port)
+            {
                 struct sockaddr_in ex_bind;
                 socklen_t sl = sizeof(ex_bind);
                 getsockname(ex->sockfd, (struct sockaddr *)&ex_bind, &sl);
-                struct {
+                struct
+                {
                     poli_tcp_ctrl_hdr hdr;
                     uint16_t port;
                 } __attribute__((packed)) synack;
@@ -183,11 +197,11 @@ int wait4connect(uint32_t ip, uint16_t port)
                 break;
             }
         }
-        if (duplicate) continue;
+        if (duplicate)
+            continue;
         break;
     }
 
-    /* Open a fresh socket on a random local port for the rest of the connection. */
     con->sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in con_bind;
     memset(&con_bind, 0, sizeof(con_bind));
@@ -199,19 +213,19 @@ int wait4connect(uint32_t ip, uint16_t port)
 
     socklen_t sl = sizeof(con_bind);
     getsockname(con->sockfd, (struct sockaddr *)&con_bind, &sl);
-    uint16_t chosen_port = con_bind.sin_port; /* network byte order */
+    uint16_t chosen_port = con_bind.sin_port;
 
     con->servaddr = client_addr;
 
-    /* Short timeout so we can retransmit SYN-ACK if the client's ACK gets lost. */
     struct timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = 200000;
     setsockopt(con->sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    while (1) {
-        /* Send SYN-ACK with the chosen port as payload */
-        struct {
+    while (1)
+    {
+        struct
+        {
             poli_tcp_ctrl_hdr hdr;
             uint16_t port;
         } __attribute__((packed)) synack;
@@ -224,23 +238,21 @@ int wait4connect(uint32_t ip, uint16_t port)
         sendto(con->sockfd, &synack, sizeof(synack), 0,
                (struct sockaddr *)&con->servaddr, sizeof(con->servaddr));
 
-        /* Wait for final ACK on the new socket */
         int n = recvfrom(con->sockfd, buf, MAX_SEGMENT_SIZE, 0, NULL, NULL);
-        if (n < (int)sizeof(poli_tcp_ctrl_hdr)) continue;
+        if (n < (int)sizeof(poli_tcp_ctrl_hdr))
+            continue;
         poli_tcp_ctrl_hdr *r = (poli_tcp_ctrl_hdr *)buf;
-        if (r->protocol_id != POLI_PROTOCOL_ID) continue;
-        /* Accept either an explicit ACK, or DATA (means our ACK got through but
-         * the client moved on and we lost the ACK ourselves). */
-        if (r->type == POLI_TYPE_ACK || r->type == POLI_TYPE_DATA) break;
+        if (r->protocol_id != POLI_PROTOCOL_ID)
+            continue;
+        if (r->type == POLI_TYPE_ACK || r->type == POLI_TYPE_DATA)
+            break;
     }
 
-    /* Clear timeout for normal data flow */
     struct timeval tv0 = {0, 0};
     setsockopt(con->sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv0, sizeof(tv0));
 
     cons.insert({con->conn_id, con});
 
-    /* Register socket and timer for the handler thread. */
     data_fds[fdmax].fd = con->sockfd;
     data_fds[fdmax].events = POLLIN;
 
@@ -264,6 +276,7 @@ void init_receiver(int recv_buffer_bytes)
     g_recv_buf_bytes = recv_buffer_bytes;
 
     pthread_t thread1;
+    /* TODO: Create the connection socket and bind it to 8031 */
     int ret = pthread_create(&thread1, NULL, receiver_handler, NULL);
     assert(ret == 0);
 }
