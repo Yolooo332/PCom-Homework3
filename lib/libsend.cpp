@@ -16,7 +16,9 @@
 
 using namespace std;
 
-std::map<int, struct connection *> cons;
+/* Intentionally leaked (never deleted) so it outlives the sender handler thread;
+   see the matching note in librecv.cpp. Avoids a shutdown use-after-free. */
+std::map<int, struct connection *> &cons = *new std::map<int, struct connection *>();
 
 struct pollfd data_fds[MAX_CONNECTIONS];
 /* Used for timers per connection */
@@ -80,21 +82,20 @@ void *sender_handler(void *arg)
     while (1)
     {
 
-        if (cons.size() == 0)
-        {
-            continue;
-        }
         int conn_id = -1;
         do
         {
             res = recv_message_or_timeout(buf, MAX_SEGMENT_SIZE, &conn_id);
         } while (res == -14);
 
-        if (cons.find(conn_id) == cons.end())
+        pthread_mutex_lock(&registry_lock);
+        auto it_con = cons.find(conn_id);
+        struct connection *con = (it_con == cons.end()) ? NULL : it_con->second;
+        pthread_mutex_unlock(&registry_lock);
+        if (con == NULL)
             continue;
 
-        pthread_mutex_lock(&cons[conn_id]->con_lock);
-        struct connection *con = cons[conn_id];
+        pthread_mutex_lock(&con->con_lock);
 
         /* Handle segment received from the receiver. We use this between locks
         as to not have synchronization issues with the send_data calls which are
@@ -137,7 +138,7 @@ void *sender_handler(void *arg)
             }
         }
 
-        pthread_mutex_unlock(&cons[conn_id]->con_lock);
+        pthread_mutex_unlock(&con->con_lock);
     }
 }
 
@@ -222,6 +223,8 @@ int setup_connection(uint32_t ip, uint16_t port)
     struct timeval off = {0, 0};
     setsockopt(con->sockfd, SOL_SOCKET, SO_RCVTIMEO, &off, sizeof(off));
 
+    /* Publish the new connection atomically with respect to the handler thread. */
+    pthread_mutex_lock(&registry_lock);
     cons.insert({con->conn_id, con});
 
     /* Since we can have multiple connection, we want to know if data is available
@@ -240,6 +243,7 @@ int setup_connection(uint32_t ip, uint16_t port)
     spec.it_interval.tv_nsec = 10 * 1000000;
     timerfd_settime(timer_fds[fdmax].fd, 0, &spec, NULL);
     fdmax++;
+    pthread_mutex_unlock(&registry_lock);
 
     DEBUG_PRINT("Connection established!");
 

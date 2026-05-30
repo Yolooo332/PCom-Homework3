@@ -26,4 +26,6 @@ Thread-uri
 
 Pe fiecare parte am un thread separat (handler) pornit din init_sender, respectiv init_receiver, care sta si asculta non stop ce vine de pe retea. Thread-ul principal e cel care apeleaza send_data / recv_data din aplicatie. Ca sa nu se calce pe picioare cele doua thread-uri am cate un mutex pe fiecare conexiune (con_lock) si toata modificarea de stare se face cu el luat.
 
+Mai e si un mutex global (registry_lock) care pazeste lista de conexiuni (cons) si tabelele de poll (data_fds / timer_fds / fdmax). Astea sunt scrise de thread-ul principal cand inregistreaza o conexiune noua in wait4connect / setup_connection si in acelasi timp citite de handler in recv_message_or_timeout. La mai multe conexiuni deodata cele doua se bateau pe ele (mai ales harta cons modificata fix cand handler-ul itera prin ea), de aia pica testele de multi-connection; cu lock-ul luat scurt la inregistrare si la snapshot-ul de poll nu mai e cursa. Lock-ul global si con_lock nu se tin niciodata in acelasi timp, deci nu se poate bloca nimic.
+
 Ma rog, cam asta e toata faza. Merge, trece testele si fisierele ies identice bit cu bit la final.

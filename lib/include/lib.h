@@ -98,3 +98,8 @@ void init_sender(int speed, int delay);
 
 /* ######### Internal API used by sender and receiver ########### */
 int recv_message_or_timeout(char *buff, size_t len, int *conn_id);
+
+/* Guards the connection registry (cons / data_fds / timer_fds / fdmax), which is
+   shared between the application thread (which registers connections) and the I/O
+   handler thread (which polls/iterates it). Defined once in libcommon.cpp. */
+extern pthread_mutex_t registry_lock;

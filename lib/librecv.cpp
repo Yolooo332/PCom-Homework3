@@ -17,7 +17,11 @@
 
 using namespace std;
 
-std::map<int, struct connection *> cons;
+/* Intentionally leaked (never deleted): the handler thread loops forever over
+   `cons`, so the map must outlive main(). A plain global would have its
+   destructor run at process exit while that thread is still iterating it -> a
+   use-after-free on shutdown. Leaking the map removes that teardown race. */
+std::map<int, struct connection *> &cons = *new std::map<int, struct connection *>();
 
 struct pollfd data_fds[MAX_CONNECTIONS];
 /* Used for timers per connection */
@@ -110,17 +114,20 @@ void *receiver_handler(void *arg)
             res = recv_message_or_timeout(segment, MAX_SEGMENT_SIZE, &conn_id);
         } while (res == -14);
 
-        if (cons.find(conn_id) == cons.end())
+        pthread_mutex_lock(&registry_lock);
+        auto it_con = cons.find(conn_id);
+        struct connection *con = (it_con == cons.end()) ? NULL : it_con->second;
+        pthread_mutex_unlock(&registry_lock);
+        if (con == NULL)
             continue;
 
-        pthread_mutex_lock(&cons[conn_id]->con_lock);
-        struct connection *con = cons[conn_id];
+        pthread_mutex_lock(&con->con_lock);
 
         /* Handle segment received from the sender. We use this between locks
         as to not have synchronization issues with the recv_data calls which are
         on the main thread */
-        int payload = poli_verify(segment, res);
-        if (payload >= (int)sizeof(poli_tcp_data_hdr))
+        int payload_len = poli_verify(segment, res);
+        if (payload_len >= (int)sizeof(poli_tcp_data_hdr))
         {
             poli_tcp_data_hdr *hdr = (poli_tcp_data_hdr *)segment;
 
@@ -129,6 +136,13 @@ void *receiver_handler(void *arg)
                 uint16_t seq = ntohs(hdr->seq_num);
                 uint16_t paylen = ntohs(hdr->len);
                 char *payload = segment + sizeof(poli_tcp_data_hdr);
+
+                /* Never trust the header length past the bytes we actually got
+                   (the CRC normally rejects a mangled len, but guard the copy so
+                   a freak collision can't over-read past the segment buffer). */
+                int avail = payload_len - (int)sizeof(poli_tcp_data_hdr);
+                if ((int)paylen > avail)
+                    paylen = (uint16_t)avail;
 
                 if (seq == con->expected_seq)
                 {
@@ -154,7 +168,7 @@ void *receiver_handler(void *arg)
             }
         }
 
-        pthread_mutex_unlock(&cons[conn_id]->con_lock);
+        pthread_mutex_unlock(&con->con_lock);
     }
 }
 
@@ -279,6 +293,10 @@ int wait4connect(uint32_t ip, uint16_t port)
     struct timeval off = {0, 0};
     setsockopt(con->sockfd, SOL_SOCKET, SO_RCVTIMEO, &off, sizeof(off));
 
+    /* Publish the new connection atomically with respect to the handler thread:
+       it must never observe an incremented fdmax before cons/data_fds/timer_fds
+       are fully populated. */
+    pthread_mutex_lock(&registry_lock);
     cons.insert({con->conn_id, con});
 
     /* Since we can have multiple connection, we want to know if data is available
@@ -297,6 +315,7 @@ int wait4connect(uint32_t ip, uint16_t port)
     spec.it_interval.tv_nsec = 0;
     timerfd_settime(timer_fds[fdmax].fd, 0, &spec, NULL);
     fdmax++;
+    pthread_mutex_unlock(&registry_lock);
 
     DEBUG_PRINT("Connection established!");
 
